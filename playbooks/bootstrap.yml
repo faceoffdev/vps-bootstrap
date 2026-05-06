@@ -1,0 +1,595 @@
+---
+- name: Bootstrap Debian VPS
+  hosts: vps
+  become: true
+  gather_facts: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  handlers:
+    - name: Restart systemd-resolved
+      ansible.builtin.service:
+        name: systemd-resolved
+        state: restarted
+
+    - name: Restart systemd-timesyncd
+      ansible.builtin.service:
+        name: systemd-timesyncd
+        state: restarted
+
+    - name: Restart systemd-journald
+      ansible.builtin.service:
+        name: systemd-journald
+        state: restarted
+
+    - name: Restart ssh
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+    - name: Restart fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
+
+    - name: Restart docker
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+
+  pre_tasks:
+    - name: Check local GHCR Vault file
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../group_vars/vault.yml"
+      delegate_to: localhost
+      become: false
+      register: ghcr_vault_file
+      when: ghcr_login_enabled | bool
+
+    - name: Load GHCR Vault variables
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../group_vars/vault.yml"
+      when:
+        - ghcr_login_enabled | bool
+        - ghcr_vault_file.stat.exists
+
+    - name: Assert supported OS family
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["os_family"] == "Debian"
+          - ansible_facts["distribution"] == "Debian"
+        fail_msg: "This bootstrap playbook is Debian-first and supports Debian VPS hosts only."
+
+    - name: Assert SSH public keys are configured
+      ansible.builtin.assert:
+        that:
+          - authorized_keys is defined
+          - authorized_keys | length > 0
+        fail_msg: "Fill group_vars/all.yml authorized_keys before applying SSH hardening."
+
+    - name: Assert GHCR Vault variables are configured
+      ansible.builtin.assert:
+        that:
+          - vault_ghcr_username is defined
+          - vault_ghcr_token is defined
+          - vault_ghcr_username | length > 0
+          - vault_ghcr_token | length > 0
+        fail_msg: "Create encrypted group_vars/vault.yml with vault_ghcr_username and vault_ghcr_token, or set ghcr_login_enabled=false."
+      when: ghcr_login_enabled | bool
+      no_log: true
+
+  tasks:
+    - name: Bootstrap DNS before APT operations
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {% for server in dns_servers %}
+          nameserver {{ server }}
+          {% endfor %}
+      when: dns_manage_resolv_conf | bool
+
+    - name: Check Debian APT repository DNS resolution
+      ansible.builtin.command: "getent hosts deb.debian.org"
+      register: debian_repo_dns
+      changed_when: false
+      retries: 5
+      delay: 3
+      until: debian_repo_dns.rc == 0
+
+    - name: Update APT cache and upgrade installed packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: "yes"
+        cache_valid_time: 3600
+
+    - name: Install baseline packages
+      ansible.builtin.apt:
+        name:
+          - apt-listchanges
+          - ca-certificates
+          - curl
+          - fail2ban
+          - gnupg
+          - python3-apt
+          - python3-systemd
+          - sudo
+          - systemd-resolved
+          - systemd-timesyncd
+          - unattended-upgrades
+          - ufw
+          - util-linux
+        state: present
+        update_cache: true
+
+    - name: Check swap file
+      ansible.builtin.stat:
+        path: "{{ swap_file_path }}"
+      register: swap_file
+      when: swap_enabled | bool
+
+    - name: Create swap file
+      ansible.builtin.command: "fallocate -l {{ swap_file_size_mb }}M {{ swap_file_path }}"
+      args:
+        creates: "{{ swap_file_path }}"
+      when:
+        - swap_enabled | bool
+        - not swap_file.stat.exists
+
+    - name: Secure swap file permissions
+      ansible.builtin.file:
+        path: "{{ swap_file_path }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: swap_enabled | bool
+
+    - name: Check swap file signature
+      ansible.builtin.command: "blkid -o value -s TYPE {{ swap_file_path }}"
+      register: swap_file_signature
+      changed_when: false
+      failed_when: false
+      when: swap_enabled | bool
+
+    - name: Format swap file
+      ansible.builtin.command: "mkswap {{ swap_file_path }}"
+      changed_when: true
+      when:
+        - swap_enabled | bool
+        - swap_file_signature.stdout != "swap"
+
+    - name: Persist swap file in fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: "^{{ swap_file_path | regex_escape }}\\s+"
+        line: "{{ swap_file_path }} none swap sw 0 0"
+        state: present
+      when: swap_enabled | bool
+
+    - name: Check active swap devices
+      ansible.builtin.command: swapon --show=NAME --noheadings
+      register: active_swap_devices
+      changed_when: false
+      when: swap_enabled | bool
+
+    - name: Enable swap file
+      ansible.builtin.command: "swapon {{ swap_file_path }}"
+      changed_when: true
+      when:
+        - swap_enabled | bool
+        - swap_file_path not in active_swap_devices.stdout_lines
+
+    - name: Configure swap tendency
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-ansible-swap.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          vm.swappiness={{ swap_swappiness }}
+      when: swap_enabled | bool
+      register: swap_sysctl_config
+
+    - name: Apply swap tendency
+      ansible.builtin.command: "sysctl -w vm.swappiness={{ swap_swappiness }}"
+      changed_when: swap_sysctl_config.changed
+      when:
+        - swap_enabled | bool
+        - swap_sysctl_config.changed
+
+    - name: Configure Redis memory overcommit
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/10-redis-overcommit.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          vm.overcommit_memory={{ redis_overcommit_memory }}
+      when: redis_memory_tuning_enabled | bool
+      register: redis_overcommit_sysctl_config
+
+    - name: Apply Redis memory overcommit
+      ansible.builtin.command: "sysctl -w vm.overcommit_memory={{ redis_overcommit_memory }}"
+      changed_when: redis_overcommit_sysctl_config.changed
+      when:
+        - redis_memory_tuning_enabled | bool
+        - redis_overcommit_sysctl_config.changed
+
+    - name: Ensure local sbin directory exists
+      ansible.builtin.file:
+        path: /usr/local/sbin
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: redis_memory_tuning_enabled | bool
+
+    - name: Install Transparent Huge Pages disable script
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/disable-thp
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          set -eu
+
+          echo "{{ transparent_hugepage_enabled_policy }}" > /sys/kernel/mm/transparent_hugepage/enabled
+
+          if [ -f /sys/kernel/mm/transparent_hugepage/defrag ]; then
+            echo "{{ transparent_hugepage_defrag_policy }}" > /sys/kernel/mm/transparent_hugepage/defrag
+          fi
+      when: redis_memory_tuning_enabled | bool
+      register: thp_disable_script
+
+    - name: Install Transparent Huge Pages disable service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/disable-thp.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Disable Transparent Huge Pages
+          DefaultDependencies=no
+          After=sysinit.target local-fs.target
+          ConditionPathExists=/sys/kernel/mm/transparent_hugepage/enabled
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/disable-thp
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+      when: redis_memory_tuning_enabled | bool
+      register: thp_service_unit
+
+    - name: Reload systemd after Transparent Huge Pages service change
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when:
+        - redis_memory_tuning_enabled | bool
+        - thp_disable_script.changed or thp_service_unit.changed
+
+    - name: Enable and run Transparent Huge Pages disable service
+      ansible.builtin.systemd_service:
+        name: disable-thp.service
+        enabled: true
+        state: started
+      when: redis_memory_tuning_enabled | bool
+
+    - name: Configure APT periodic unattended upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+
+    - name: Configure unattended security updates without automatic reboot
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/51unattended-upgrades-security
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          Unattended-Upgrade::Origins-Pattern {
+            "origin=Debian,codename=${distro_codename},label=Debian-Security";
+            "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+          };
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+          Unattended-Upgrade::Automatic-Reboot "false";
+
+    - name: Ensure systemd-resolved drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure provider-independent DNS resolvers
+      ansible.builtin.copy:
+        dest: /etc/systemd/resolved.conf.d/10-ansible-dns.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Resolve]
+          DNS={{ dns_servers | join(' ') }}
+          FallbackDNS={{ dns_servers | join(' ') }}
+      notify: Restart systemd-resolved
+
+    - name: Enable systemd-resolved
+      ansible.builtin.service:
+        name: systemd-resolved
+        enabled: true
+        state: started
+
+    - name: Manage /etc/resolv.conf through systemd-resolved
+      ansible.builtin.file:
+        src: /run/systemd/resolve/stub-resolv.conf
+        dest: /etc/resolv.conf
+        state: link
+        force: true
+      when: dns_manage_resolv_conf | bool
+
+    - name: Apply DNS resolver changes before network downloads
+      ansible.builtin.meta: flush_handlers
+
+    - name: Check Docker download host DNS resolution
+      ansible.builtin.command: getent hosts download.docker.com
+      register: docker_download_dns
+      changed_when: false
+      retries: 5
+      delay: 3
+      until: docker_download_dns.rc == 0
+
+    - name: Ensure systemd-timesyncd drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/timesyncd.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure time synchronization
+      ansible.builtin.copy:
+        dest: /etc/systemd/timesyncd.conf.d/10-ansible-ntp.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Time]
+          NTP={{ ntp_servers | join(' ') }}
+          FallbackNTP={{ ntp_fallback_servers | join(' ') }}
+      notify: Restart systemd-timesyncd
+
+    - name: Enable systemd-timesyncd
+      ansible.builtin.service:
+        name: systemd-timesyncd
+        enabled: true
+        state: started
+
+    - name: Ensure journald drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Limit systemd journal disk usage
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/10-ansible-limits.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Journal]
+          SystemMaxUse={{ journald_system_max_use }}
+      notify: Restart systemd-journald
+
+    - name: Create bootstrap user's primary group
+      ansible.builtin.group:
+        name: "{{ bootstrap_user }}"
+        state: present
+
+    - name: Create bootstrap user
+      ansible.builtin.user:
+        name: "{{ bootstrap_user }}"
+        group: "{{ bootstrap_user }}"
+        shell: /bin/bash
+        create_home: true
+        groups:
+          - sudo
+        append: true
+        state: present
+
+    - name: Allow passwordless sudo for bootstrap user
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ bootstrap_user }}"
+        owner: root
+        group: root
+        mode: "0440"
+        content: |
+          {{ bootstrap_user }} ALL=(ALL) NOPASSWD:ALL
+        validate: /usr/sbin/visudo -cf %s
+
+    - name: Ensure SSH directory exists for bootstrap user
+      ansible.builtin.file:
+        path: "/home/{{ bootstrap_user }}/.ssh"
+        state: directory
+        owner: "{{ bootstrap_user }}"
+        group: "{{ bootstrap_user }}"
+        mode: "0700"
+
+    - name: Install SSH public keys for bootstrap user
+      ansible.builtin.copy:
+        dest: "/home/{{ bootstrap_user }}/.ssh/authorized_keys"
+        owner: "{{ bootstrap_user }}"
+        group: "{{ bootstrap_user }}"
+        mode: "0600"
+        content: |
+          {% for key in authorized_keys %}
+          {{ key }}
+          {% endfor %}
+
+    - name: Configure SSH daemon hardening
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        insertbefore: "^Match\\s+"
+        validate: /usr/sbin/sshd -t -f %s
+      loop:
+        - regexp: "^#?\\s*Port\\s+"
+          line: "Port {{ ssh_port }}"
+        - regexp: "^#?\\s*PasswordAuthentication\\s+"
+          line: "PasswordAuthentication no"
+        - regexp: "^#?\\s*KbdInteractiveAuthentication\\s+"
+          line: "KbdInteractiveAuthentication no"
+        - regexp: "^#?\\s*PermitRootLogin\\s+"
+          line: "PermitRootLogin no"
+        - regexp: "^#?\\s*PubkeyAuthentication\\s+"
+          line: "PubkeyAuthentication yes"
+        - regexp: "^#?\\s*AllowUsers\\s+"
+          line: "AllowUsers {{ bootstrap_user }}"
+      notify: Restart ssh
+
+    - name: Allow required UFW ports
+      ansible.builtin.command: "ufw allow {{ item }}"
+      loop: "{{ ufw_allowed_ports }}"
+      register: ufw_allow_ports
+      changed_when: "'Skipping adding existing rule' not in ufw_allow_ports.stdout"
+
+    - name: Set UFW default outgoing policy
+      ansible.builtin.command: ufw default allow outgoing
+      register: ufw_default_outgoing
+      changed_when: "'Default outgoing policy changed' in ufw_default_outgoing.stdout"
+
+    - name: Set UFW default incoming policy
+      ansible.builtin.command: ufw default deny incoming
+      register: ufw_default_incoming
+      changed_when: "'Default incoming policy changed' in ufw_default_incoming.stdout"
+
+    - name: Configure Fail2ban SSH jail
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.d/sshd-ansible.local
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [sshd]
+          enabled = {{ 'true' if fail2ban_sshd_enabled else 'false' }}
+          port = {{ ssh_port }}
+          filter = sshd
+          backend = systemd
+          maxretry = {{ fail2ban_sshd_maxretry }}
+          findtime = {{ fail2ban_sshd_findtime }}
+          bantime = {{ fail2ban_sshd_bantime }}
+      notify: Restart fail2ban
+
+    - name: Enable Fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    - name: Ensure Docker APT keyring directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install Docker APT repository signing key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/debian/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Configure Docker official Debian APT repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch={{ docker_apt_arch }} signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/debian {{ ansible_facts["distribution_release"] }} stable
+        filename: docker
+        state: present
+        update_cache: true
+
+    - name: Install Docker Engine and Compose plugin
+      ansible.builtin.apt:
+        name:
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-ce
+          - docker-ce-cli
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Configure Docker daemon logging
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {
+            "log-driver": "{{ docker_log_driver }}",
+            "log-opts": {
+              "max-size": "{{ docker_log_max_size }}",
+              "max-file": "{{ docker_log_max_file }}",
+              "compress": "{{ docker_log_compress }}"
+            }
+          }
+      notify: Restart docker
+
+    - name: Enable Docker service
+      ansible.builtin.service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Add bootstrap user to docker group
+      ansible.builtin.user:
+        name: "{{ bootstrap_user }}"
+        groups:
+          - docker
+        append: true
+
+    - name: Log in to ghcr.io as bootstrap user
+      ansible.builtin.command: docker login ghcr.io -u "{{ vault_ghcr_username }}" --password-stdin
+      become: true
+      become_user: "{{ bootstrap_user }}"
+      environment:
+        HOME: "/home/{{ bootstrap_user }}"
+      args:
+        stdin: "{{ vault_ghcr_token }}"
+      changed_when: false
+      no_log: true
+      when: ghcr_login_enabled | bool
+
+    - name: Enable UFW
+      ansible.builtin.command: ufw --force enable
+      register: ufw_enable
+      changed_when: "'Firewall is active and enabled' not in ufw_enable.stdout"
+
+    - name: Check whether reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Report reboot requirement
+      ansible.builtin.debug:
+        msg: "Reboot is required. Reconnect manually when convenient."
+      when: reboot_required.stat.exists

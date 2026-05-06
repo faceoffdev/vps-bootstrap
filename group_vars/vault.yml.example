@@ -1,0 +1,8 @@
+---
+# Create the real encrypted file with:
+#   ansible-vault create group_vars/vault.yml
+#
+# Then put these variables inside it:
+vault_ghcr_username: username
+vault_ghcr_token: ghp_abcd1234efgh5678ijkl9012mnop3456qrstuvwx
+

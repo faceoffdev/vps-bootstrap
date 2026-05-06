@@ -1,0 +1,59 @@
+---
+bootstrap_user: deploy
+ssh_port: 22024
+
+# Replace with your real public keys before the first run.
+# The playbook refuses to harden SSH while this list is empty.
+authorized_keys:
+  - ssh-rsa AAAA+BBBB deploy@my-laptop
+
+ufw_allowed_ports:
+  - "22024/tcp"
+  - "80/tcp"
+  - "443/tcp"
+
+dns_manage_resolv_conf: true
+dns_servers:
+  - "9.9.9.9"
+  - "149.112.112.112"
+  - "8.8.8.8"
+  - "1.1.1.1"
+
+ntp_servers:
+  - "time.cloudflare.com"
+  - "time.google.com"
+ntp_fallback_servers:
+  - "0.debian.pool.ntp.org"
+  - "1.debian.pool.ntp.org"
+  - "2.debian.pool.ntp.org"
+  - "3.debian.pool.ntp.org"
+
+swap_enabled: true
+swap_file_path: /swapfile
+swap_file_size_mb: 2048
+swap_swappiness: 10
+
+redis_memory_tuning_enabled: true
+redis_overcommit_memory: 1
+transparent_hugepage_enabled_policy: never
+transparent_hugepage_defrag_policy: never
+
+journald_system_max_use: "100M"
+
+fail2ban_sshd_enabled: true
+fail2ban_sshd_maxretry: 3
+fail2ban_sshd_findtime: "10m"
+fail2ban_sshd_bantime: "24h"
+
+docker_apt_arch_map:
+  x86_64: amd64
+  aarch64: arm64
+  armv7l: armhf
+  armv6l: armhf
+docker_apt_arch: "{{ docker_apt_arch_map.get(ansible_facts['architecture'], ansible_facts['architecture']) }}"
+docker_log_driver: local
+docker_log_max_size: "20m"
+docker_log_max_file: "5"
+docker_log_compress: "true"
+
+ghcr_login_enabled: true

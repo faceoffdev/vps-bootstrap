@@ -1,0 +1,5 @@
+group_vars/vault.yml
+*.retry
+
+.idea
+.DS_Store
